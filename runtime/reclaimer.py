@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""Pelican adapter for Project Reclaimer. Requires Python 3.11+ and Wine 10."""
+
+from __future__ import annotations
+
+import copy
+import datetime
+import json
+import math
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import tomllib
+from collections.abc import Mapping
+
+
+READY = "[Pelican] Project Reclaimer is ready"
+GENERATED_CONFIG = "dedicated.pelican.toml"
+
+
+def integer(env: Mapping[str, str], key: str, default: int, low: int, high: int) -> int:
+    try:
+        value = int(env.get(key, str(default)))
+    except ValueError as exc:
+        raise ValueError(f"{key} must be an integer") from exc
+    if not low <= value <= high:
+        raise ValueError(f"{key} must be between {low} and {high}")
+    return value
+
+
+def build_config(source: dict, env: Mapping[str, str]) -> dict:
+    """Apply panel controls without changing the user's advanced template."""
+    result = copy.deepcopy(source)
+    servers = result.get("server", [])
+    if not isinstance(servers, list) or len(servers) != 1:
+        raise ValueError("dedicated.toml must contain exactly one [[server]]; create another Pelican server for another instance")
+    server = servers[0]
+    if not isinstance(server, dict):
+        raise ValueError("The [[server]] entry must be a table")
+    if "SERVER_PORT" not in env:
+        raise ValueError("SERVER_PORT is missing; Pelican must supply the primary allocation")
+    port = integer(env, "SERVER_PORT", 49176, 1024, 65535)
+    master_port = integer(env, "RECLAIMER_MASTER_PORT", 49175, 1024, 65535)
+    maximum = integer(env, "RECLAIMER_MAX_PLAYERS", 16, 1, 127)
+    name = env.get("RECLAIMER_SERVER_NAME", "Halo 3 - Project Reclaimer")
+    if not name.strip() or len(name) > 48 or any(ord(c) < 32 or ord(c) == 127 for c in name):
+        raise ValueError("RECLAIMER_SERVER_NAME must be 1-48 characters without control characters")
+    password = env.get("RECLAIMER_RCON_PASSWORD", "")
+    if password and len(password) < 8:
+        raise ValueError("RECLAIMER_RCON_PASSWORD must be empty or at least 8 characters")
+    if password and master_port == port:
+        raise ValueError("RCON and discovery need different TCP ports; change RECLAIMER_MASTER_PORT")
+
+    # Keep executable updates under Pelican's reinstall control. Windows
+    # self-replacement under Wine must not silently change a pinned release.
+    result["auto_update"] = False
+    result["upnp"] = False
+    result["public_address"] = env.get("RECLAIMER_PUBLIC_ADDRESS", "")
+    result.setdefault("master", {}).update(enabled=True, port=master_port)
+    result.setdefault("rcon", {}).update(password=password, address="0.0.0.0")
+    server.update(name=name, port=port, max_players=maximum, enabled=True)
+    # RCON uses TCP at the primary game port; do not retain a template's
+    # rcon_port/rcon_password that bypasses the panel controls.
+    server.pop("rcon_port", None)
+    server.pop("rcon_password", None)
+    playlist = env.get("RECLAIMER_PLAYLIST", "").strip()
+    if "campaign" in server:
+        if maximum > 16:
+            raise ValueError("Campaign co-op supports at most 16 players")
+        if playlist:
+            raise ValueError("Clear RECLAIMER_PLAYLIST when using a campaign template")
+        for key in ("map", "game", "playlist", "variant", "base_map"):
+            server.pop(key, None)
+    else:
+        for key in ("map", "game", "playlist", "variant", "base_map"):
+            server.pop(key, None)
+        if playlist:
+            server["playlist"] = playlist
+        else:
+            server["map"] = env.get("RECLAIMER_MAP", "Guardian")
+            server["game"] = env.get("RECLAIMER_GAME_MODE", "Slayer")
+    return result
+
+
+def toml_value(value: object) -> str:
+    """Serialize TOML values as inline tables, retaining all advanced keys."""
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False).replace("\x7f", r"\u007f")
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "nan"
+        if math.isinf(value):
+            return "inf" if value > 0 else "-inf"
+        return repr(value)
+    if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
+        return value.isoformat()
+    if isinstance(value, list):
+        return "[" + ", ".join(toml_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        return "{ " + ", ".join(f"{toml_value(key)} = {toml_value(item)}" for key, item in value.items()) + " }"
+    raise ValueError(f"Unsupported TOML value: {type(value).__name__}")
+
+
+def write_config(root: Path, env: Mapping[str, str]) -> Path:
+    source = tomllib.loads((root / "dedicated.toml").read_text(encoding="utf-8-sig"))
+    config = build_config(source, env)
+    text = "# Generated by the Pelican adapter; edit dedicated.toml and panel settings.\n"
+    text += "\n".join(f"{toml_value(key)} = {toml_value(value)}" for key, value in config.items()) + "\n"
+    tomllib.loads(text)  # Reject serialization problems before replacing anything.
+    target = root / GENERATED_CONFIG
+    pending = target.with_suffix(".toml.new")
+    pending.write_text(text, encoding="utf-8", newline="\n")
+    pending.chmod(0o600)
+    pending.replace(target)
+    return target
+
+
+class Runner:
+    def __init__(self) -> None:
+        self.active: subprocess.Popen | None = None
+        self.stopping = False
+
+    @staticmethod
+    def send(process: subprocess.Popen, sig: int) -> None:
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, sig)
+            except ProcessLookupError:
+                pass
+
+    def stop(self, _sig: int, _frame: object) -> None:
+        self.stopping = True
+        if self.active is not None:
+            self.send(self.active, signal.SIGINT)
+
+    def command(self, args: list[str]) -> int:
+        if self.stopping:
+            return 0
+        self.active = subprocess.Popen(args, start_new_session=True)
+        stopping_since: float | None = None
+        while True:
+            try:
+                result = self.active.wait(timeout=0.2)
+                break
+            except subprocess.TimeoutExpired:
+                if self.stopping:
+                    now = time.monotonic()
+                    if stopping_since is None:
+                        stopping_since = now
+                    if now - stopping_since > 25:
+                        self.send(self.active, signal.SIGKILL)
+        self.active = None
+        return result
+
+    @staticmethod
+    def probe(args: list[str]) -> bool:
+        process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        try:
+            return process.wait(timeout=5) == 0
+        except subprocess.TimeoutExpired:
+            Runner.send(process, signal.SIGKILL)
+            process.wait()
+            return False
+
+    def serve(self, command: list[str], status: list[str]) -> int:
+        if self.stopping:
+            return 0
+        self.active = subprocess.Popen(command, start_new_session=True)
+        ready = False
+        next_probe = time.monotonic() + 3
+        stopping_since: float | None = None
+        while self.active.poll() is None:
+            now = time.monotonic()
+            if self.stopping:
+                if stopping_since is None:
+                    stopping_since = now
+                if now - stopping_since > 25:
+                    self.send(self.active, signal.SIGKILL)
+            elif not ready and now >= next_probe:
+                if self.probe(status) and not self.stopping and self.active.poll() is None:
+                    print(READY, flush=True)
+                    ready = True
+                next_probe = time.monotonic() + 3
+            time.sleep(0.2)
+        result = self.active.wait()
+        self.active = None
+        return 0 if self.stopping else (result if result > 0 else 1)
+
+
+def main() -> int:
+    root = Path(__file__).resolve().parent
+    os.chdir(root)
+    if sys.argv[1:] not in ([], ["check"]):
+        raise ValueError("Usage: python3 reclaimer.py [check]")
+    if not (root / "project-reclaimer.exe").is_file():
+        raise ValueError("project-reclaimer.exe is missing; reinstall the server in Pelican")
+    config = write_config(root, os.environ)
+    wine = shutil.which("wine") or shutil.which("wine64")
+    if wine is None:
+        raise ValueError("Wine is missing; use the egg's Pelican Wine 10 image on an x86_64 Linux node")
+    os.environ["WINEARCH"] = "win64"
+    os.environ.setdefault("WINEPREFIX", str(root / ".wine"))
+    os.environ["WINEDEBUG"] = "-all"
+    os.environ["WINEDLLOVERRIDES"] = "mscoree,mshtml="
+    os.environ["RECLAIMER_DEDICATED_ONLY"] = "1"
+    os.environ["RECLAIMER_DEDICATED_AUTO_UPDATE"] = "false"
+    # The Wine prefix, Forge cache and user data all live in Pelican's
+    # persistent volume. Pelican's Wine entrypoint provides the Xvfb display.
+    runner = Runner()
+    signal.signal(signal.SIGINT, runner.stop)
+    signal.signal(signal.SIGTERM, runner.stop)
+    prefix = Path(os.environ["WINEPREFIX"])
+    if not (prefix / "system.reg").is_file():
+        print("[Pelican] Initializing the persistent 64-bit Wine prefix...", flush=True)
+        if runner.command([wine, "wineboot", "--init"]) != 0:
+            return 0 if runner.stopping else 1
+    if runner.stopping:
+        return 0
+    if runner.command([wine, "reg", "add", r"HKCU\Software\Wine\Drivers", "/v", "Audio", "/t", "REG_SZ", "/f"]) != 0:
+        return 0 if runner.stopping else 1
+    command = [wine, str(root / "project-reclaimer.exe"), "dedicated", "--config", str(config)]
+    print("[Pelican] Checking Halo 3 files, configuration and allocated ports...", flush=True)
+    result = runner.command([*command, "check"])
+    if runner.stopping:
+        return 0
+    if result:
+        print("[Pelican] Check failed. Upload your prepared MCC files into game/ and fix the errors above.", flush=True)
+        return 1
+    if sys.argv[1:] == ["check"]:
+        print("[Pelican] Validation passed; the server has not been started.", flush=True)
+        return 0
+    print("[Pelican] Starting Project Reclaimer; waiting for its status check...", flush=True)
+    return runner.serve(command, [*command, "status"])
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (ValueError, OSError) as error:
+        print(f"[Pelican] Error: {error}", file=sys.stderr, flush=True)
+        raise SystemExit(1)

@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "name": "Pelican Slayer rotation",
+  "vote_seconds": 20,
+  "games": [
+    { "map": "Guardian", "game": "Slayer" },
+    { "map": "Valhalla", "game": "Slayer" },
+    { "map": "The Pit", "game": "Slayer" }
+  ]
+}

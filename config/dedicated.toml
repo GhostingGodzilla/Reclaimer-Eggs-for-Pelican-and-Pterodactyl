@@ -1,0 +1,40 @@
+# Advanced settings template. The egg reads this file and writes
+# dedicated.pelican.toml on start. Keep exactly one [[server]] here.
+# Panel settings control the name, ports, map/mode or playlist, max players,
+# public address and RCON password. Other settings below are preserved.
+game = "game"
+content = "content"
+data = "data"
+bans = "bans.json"
+public_address = ""
+upnp = false
+auto_update = false
+auto_reload = true
+host_name = "Pelican Halo 3"
+admins = []
+
+[master]
+enabled = true
+port = 49175
+peers = []
+
+[rcon]
+password = ""
+address = "0.0.0.0"
+
+[defaults]
+max_players = 16
+min_players = 1
+anti_cheat = "enforce"
+block_vpn = true
+voice = true
+text_chat = true
+votes = true
+share_mods = false
+share_rate = 20
+
+[[server]]
+name = "Halo 3 - Project Reclaimer"
+port = 49176
+map = "Guardian"
+game = "Slayer"
